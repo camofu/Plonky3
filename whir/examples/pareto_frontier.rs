@@ -4,8 +4,9 @@
 //!
 //! PR #1607 measured FRI and WHIR at a single (default) parameterisation and
 //! reported one point each. The interesting comparison is the *frontier*: WHIR
-//! exposes more knobs (per-round inverse-rate schedule + folding factor), so it
-//! can slide along a prover-cost-vs-argument-size curve that vanilla FRI cannot.
+//! exposes more knobs (arbitrary folding strategy + per-round inverse-rate
+//! schedule), so it can slide along a prover-cost-vs-argument-size curve that
+//! vanilla FRI cannot.
 //!
 //! This example sweeps each protocol over its own knobs, holding the *claim*
 //! fixed (the §1.1 univariate/multilinear bridge of PR #1607: 2^m elements as
@@ -21,10 +22,20 @@
 //!
 //! # Knobs swept
 //!
-//! WHIR: folding factor `k`, rate-schedule slope `Δ` (per-round log-inv-rate
-//! increment, valid range 0..=k), and starting log-inv-rate. `Δ=0` → flat rate,
-//! oracles decay by 2^k (cheap prover, many queries); `Δ=k-1` → the PR default
-//! decay-by-2; `Δ=k` → constant-size oracles (dearest prover, fewest queries).
+//! WHIR: folding strategy, starting log-inv-rate, and inner per-round
+//! log-inv-rate schedule. By default this covers several constant and
+//! first-round-special folding strategies and affine schedules; set
+//! `PARETO_EXHAUSTIVE_RATES=1` to enumerate every legal inner-rate sequence.
+//! By default the folding sweep does a randomized grid search over per-round
+//! folding sequences with entries in `1..=10` and at most 4 intermediate WHIR
+//! rounds. The default samples random points in the full grid of
+//! `(folding vector, starting rate, inner-rate vector)`, plus a few
+//! constant-folding baselines, to keep the example maintainable as WHIR's best
+//! region moves. Override the total sample cap with `PARETO_WHIR_SAMPLES`
+//! (capped at 10000), force the initial folding/leaf arity with
+//! `PARETO_WHIR_FIRST_FOLDING` (e.g. `8` for 256-wide first leaves), set the
+//! maximum folding entry with `PARETO_WHIR_MAX_FOLDING`, and starting rates with
+//! `PARETO_WHIR_STARTS`.
 //!
 //! FRI: `log_blowup` (rate) and `max_log_arity`. `num_queries` is derived as the
 //! minimum reaching the target soundness under the same capacity-regime formula.
@@ -38,6 +49,7 @@
 //!
 //! Outputs `pareto_frontier.svg` and `pareto_data.csv` in the crate root.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Instant;
@@ -64,8 +76,8 @@ use p3_whir::pcs::proof::PcsProof;
 use p3_whir::pcs::prover::WhirProver;
 use p3_whir::sumcheck::layout::{Layout, SuffixProver, Table, Witness};
 use p3_whir::sumcheck::{OpeningProtocol, TableShape, TableSpec};
-use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
 
 // ---------------------------------------------------------------------------
 // Shared substrate (matched on both sides), lifted from benches/fri_vs_whir.rs.
@@ -88,6 +100,9 @@ const LOG_FRI_BATCH_WIDTH: usize = 8;
 const BENCH_SEED: u64 = 0xA17_5C0DE;
 /// FRI final-polynomial truncation log (open the final poly at one point).
 const FRI_LOG_FINAL_POLY_LEN: usize = 0;
+/// Extension degree of `EF` over `F`; used when normalising analytic oracle
+/// lengths to base-field elements.
+const EXT_DEGREE: u128 = 4;
 
 /// Minimum FRI query count reaching `SECURITY_LEVEL` under the capacity formula
 /// `log_blowup * queries + query_pow >= security_level`.
@@ -144,10 +159,14 @@ struct WhirBuilt<MT: Mmcs<F>, Ch> {
     oracle_len: u128,
     /// Per-round query counts followed by the final-phase query count.
     queries: Vec<usize>,
+    /// Number of evaluations carried by each query opening. This is the often
+    /// overlooked term in argument size: high folding factors make every queried
+    /// leaf much wider, even if they reduce the number of rounds.
+    query_widths: Vec<usize>,
 }
 
-/// Build a WHIR rig for `(m, log_width)` at folding factor `k`, rate-schedule
-/// slope `delta`, and starting log-inv-rate `starting`.
+/// Build a WHIR rig for `(m, log_width)` with an arbitrary folding strategy and
+/// explicit per-round inverse-rate schedule.
 ///
 /// Returns `None` if the resulting `WhirConfig` is invalid (panics during
 /// construction, e.g. a rate step that would grow the RS domain or a two-adicity
@@ -155,8 +174,8 @@ struct WhirBuilt<MT: Mmcs<F>, Ch> {
 fn whir_build<MT, Ch, const DIGEST_ELEMS: usize>(
     num_variables: usize,
     log_width: usize,
-    k: usize,
-    delta: usize,
+    folding_factor: FoldingFactor,
+    round_log_inv_rates: Vec<usize>,
     starting: usize,
     mmcs: MT,
     base_challenger: Ch,
@@ -167,14 +186,10 @@ where
 {
     let log_height = num_variables - log_width;
     let width = 1 << log_width;
-    let folding_factor = FoldingFactor::Constant(k);
 
-    // One inverse-rate entry per intermediate round: rate += delta each round,
-    // starting from `starting` (the rate of the first committed codeword).
-    let (num_rounds, _) = folding_factor.compute_number_of_rounds(num_variables);
-    let round_log_inv_rates: Vec<usize> = (0..num_rounds)
-        .map(|round| starting + (round + 1) * delta)
-        .collect();
+    let rate_seed = round_log_inv_rates
+        .iter()
+        .fold(0u64, |acc, r| acc.wrapping_mul(31) ^ (*r as u64));
 
     let params = ProtocolParameters {
         security_level: SECURITY_LEVEL,
@@ -197,34 +212,44 @@ where
         return None;
     }
 
-    // Total committed oracle length = initial codeword + every per-round codeword.
-    // The trailing direct-send phase commits no codeword, so it is excluded.
+    // Total committed oracle length in base-field elements = initial base
+    // codeword + every per-round extension-field codeword. The trailing
+    // direct-send phase commits no codeword, so it is excluded.
     let mut oracle_len: u128 = 1u128 << (num_variables + starting);
     let mut queries = Vec::with_capacity(config.round_parameters.len() + 1);
+    let mut query_widths = Vec::with_capacity(config.round_parameters.len() + 1);
     for r in &config.round_parameters {
-        oracle_len += 1u128 << (r.num_variables + r.log_inv_rate);
+        oracle_len += EXT_DEGREE * (1u128 << (r.num_variables + r.log_inv_rate));
         queries.push(r.num_queries);
+        query_widths.push(1usize << r.folding_factor);
     }
     queries.push(config.final_queries);
+    query_widths.push(
+        1usize
+            << config
+                .folding_factor
+                .at_round(config.round_parameters.len()),
+    );
 
     let seed = BENCH_SEED
         ^ ((num_variables as u64) << 16)
         ^ ((log_width as u64) << 8)
-        ^ ((k as u64) << 4)
-        ^ (delta as u64);
+        ^ ((starting as u64) << 4)
+        ^ rate_seed;
     let mut rng = SmallRng::seed_from_u64(seed);
 
     let columns = (0..width)
         .map(|_| Poly::<F>::rand(&mut rng, log_height))
         .collect();
     let table = Table::new(columns);
-    let witness = WhirLayout::new_witness(vec![table], k);
+    let initial_folding = config.folding_factor.at_round(0);
+    let witness = WhirLayout::new_witness(vec![table], initial_folding);
 
     let protocol = OpeningProtocol::new(vec![TableSpec::new(
         TableShape::new(log_height, width),
         vec![(0..width).collect()],
     )])
-    .pad_to_min_num_variables(k);
+    .pad_to_min_num_variables(initial_folding);
 
     let dft = Dft::new(1 << config.max_fft_size());
     let pcs = WhirPcsTy::<MT, Ch>::new(config, dft, mmcs);
@@ -242,6 +267,7 @@ where
         },
         oracle_len,
         queries,
+        query_widths,
     })
 }
 
@@ -343,9 +369,15 @@ where
 type FriProofTy<InMmcs, ChMmcs> = p3_fri::FriProof<EF, ChMmcs, F, Vec<BatchOpening<F, InMmcs>>>;
 type FriCommitTy<InMmcs> = <InMmcs as Mmcs<F>>::Commitment;
 
-/// Total committed FRI oracle length in field elements: the input-matrix LDE
-/// (the big Merkle commit) plus the FFT-free commit-phase codewords.
-fn fri_oracle_len(num_variables: usize, log_width: usize, log_blowup: usize, max_log_arity: usize) -> u128 {
+/// Total committed FRI oracle length in base-field elements: the input-matrix
+/// LDE (the big Merkle commit, over `F`) plus the FFT-free commit-phase
+/// codewords (over `EF`, hence multiplied by `EXT_DEGREE`).
+fn fri_oracle_len(
+    num_variables: usize,
+    log_width: usize,
+    log_blowup: usize,
+    max_log_arity: usize,
+) -> u128 {
     // Input matrix LDE: 2^log_width columns of 2^(log_height + log_blowup) rows.
     let mut total: u128 = 1u128 << (num_variables + log_blowup);
     // Commit phase folds a single reduced codeword starting at the per-column LDE
@@ -353,7 +385,7 @@ fn fri_oracle_len(num_variables: usize, log_width: usize, log_blowup: usize, max
     let floor = log_blowup + FRI_LOG_FINAL_POLY_LEN;
     let mut h = num_variables - log_width + log_blowup;
     while h > floor {
-        total += 1u128 << h;
+        total += EXT_DEGREE * (1u128 << h);
         h -= max_log_arity.min(h - floor);
     }
     total
@@ -515,10 +547,322 @@ mod poseidon1 {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
+struct WhirCandidate {
+    name: String,
+    group: usize,
+    folding_factor: FoldingFactor,
+    starting: usize,
+    round_log_inv_rates: Vec<usize>,
+}
+
+#[allow(dead_code)]
+fn whir_folding_candidates(num_variables: usize) -> Vec<(String, usize, FoldingFactor)> {
+    let max_folding = std::env::var("PARETO_WHIR_MAX_FOLDING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let max_intermediate_rounds = std::env::var("PARETO_WHIR_MAX_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let samples = std::env::var("PARETO_WHIR_FOLDING_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(96);
+
+    fn try_push(
+        out: &mut Vec<(String, usize, FoldingFactor)>,
+        seen: &mut HashSet<Vec<usize>>,
+        factors: Vec<usize>,
+        max_intermediate_rounds: usize,
+        num_variables: usize,
+    ) {
+        if !seen.insert(factors.clone()) {
+            return;
+        }
+        let folding = FoldingFactor::PerRound(factors.clone());
+        if folding.check_validity(num_variables).is_err() {
+            return;
+        }
+        let Some((rounds, _)) = panic::catch_unwind(AssertUnwindSafe(|| {
+            folding.compute_number_of_rounds(num_variables)
+        }))
+        .ok() else {
+            return;
+        };
+        // `PerRound` configs must contain exactly one folding phase per
+        // intermediate round plus the final direct-send fold.
+        if rounds <= max_intermediate_rounds && factors.len() == rounds + 1 {
+            let name = factors
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join("-");
+            out.push((name, factors[0], folding));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Always include the PR-style constant-k baselines when they fit.
+    for k in 1..=max_folding {
+        for len in 1..=max_intermediate_rounds + 1 {
+            try_push(
+                &mut out,
+                &mut seen,
+                vec![k; len],
+                max_intermediate_rounds,
+                num_variables,
+            );
+        }
+    }
+
+    // Randomized grid search over [max_folding]^len for len <= max_rounds + 1.
+    let mut rng =
+        SmallRng::seed_from_u64(BENCH_SEED ^ ((num_variables as u64) << 32) ^ 0x5748_4952);
+    let mut attempts = 0;
+    while out.len() < samples && attempts < samples * 100 {
+        attempts += 1;
+        let len = rng.random_range(1..=max_intermediate_rounds + 1);
+        let factors = (0..len)
+            .map(|_| rng.random_range(1..=max_folding))
+            .collect();
+        try_push(
+            &mut out,
+            &mut seen,
+            factors,
+            max_intermediate_rounds,
+            num_variables,
+        );
+    }
+
+    out
+}
+
+fn parse_usize_list(var: &str, default: &[usize]) -> Vec<usize> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .filter(|v: &Vec<_>| !v.is_empty())
+        .unwrap_or_else(|| default.to_vec())
+}
+
+fn whir_random_candidates(num_variables: usize, starts: &[usize]) -> Vec<WhirCandidate> {
+    let max_folding = std::env::var("PARETO_WHIR_MAX_FOLDING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let max_intermediate_rounds = std::env::var("PARETO_WHIR_MAX_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let samples = std::env::var("PARETO_WHIR_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512usize)
+        .min(10_000);
+    let forced_first_folding = std::env::var("PARETO_WHIR_FIRST_FOLDING")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
+    fn try_make(
+        num_variables: usize,
+        max_intermediate_rounds: usize,
+        factors: Vec<usize>,
+        starting: usize,
+        rng: &mut SmallRng,
+    ) -> Option<WhirCandidate> {
+        let folding_factor = FoldingFactor::PerRound(factors.clone());
+        folding_factor.check_validity(num_variables).ok()?;
+        let (rounds, _) = panic::catch_unwind(AssertUnwindSafe(|| {
+            folding_factor.compute_number_of_rounds(num_variables)
+        }))
+        .ok()?;
+        if rounds > max_intermediate_rounds || factors.len() != rounds + 1 {
+            return None;
+        }
+
+        let mut prev = starting;
+        let mut round_log_inv_rates = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            // Legal grid point: 1 <= next_rate <= prev_rate + folding_i.
+            let next = rng.random_range(1..=prev + folding_factor.at_round(round));
+            round_log_inv_rates.push(next);
+            prev = next;
+        }
+
+        let fold_name = factors
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join("-");
+        Some(WhirCandidate {
+            name: format!("f={fold_name} s={starting} r={round_log_inv_rates:?}"),
+            group: factors[0],
+            folding_factor,
+            starting,
+            round_log_inv_rates,
+        })
+    }
+
+    let mut rng = SmallRng::seed_from_u64(BENCH_SEED ^ ((num_variables as u64) << 32) ^ 0xC0FFEE);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    // Keep a small set of constant-folding baselines, but do not grid-search
+    // their rate schedules.
+    for k in 3..=max_folding {
+        if forced_first_folding.is_some_and(|first| first != k) {
+            continue;
+        }
+        for &starting in starts {
+            for len in 1..=max_intermediate_rounds + 1 {
+                let factors = vec![k; len];
+                if let Some(c) = try_make(
+                    num_variables,
+                    max_intermediate_rounds,
+                    factors,
+                    starting,
+                    &mut rng,
+                ) {
+                    if seen.insert(c.name.clone()) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut attempts = 0usize;
+    while out.len() < samples && attempts < samples.saturating_mul(100) {
+        attempts += 1;
+        let len = rng.random_range(1..=max_intermediate_rounds + 1);
+        let mut factors: Vec<usize> = (0..len)
+            .map(|_| rng.random_range(1..=max_folding))
+            .collect();
+        if let Some(first) = forced_first_folding {
+            factors[0] = first;
+        }
+        let starting = starts[rng.random_range(0..starts.len())];
+        let Some(c) = try_make(
+            num_variables,
+            max_intermediate_rounds,
+            factors,
+            starting,
+            &mut rng,
+        ) else {
+            continue;
+        };
+        if seen.insert(c.name.clone()) {
+            out.push(c);
+        }
+    }
+
+    out
+}
+
+#[allow(dead_code)]
+fn whir_rate_schedules(
+    folding: &FoldingFactor,
+    num_variables: usize,
+    starting: usize,
+) -> Vec<Vec<usize>> {
+    let (num_rounds, _) = folding.compute_number_of_rounds(num_variables);
+    if num_rounds == 0 {
+        return vec![vec![]];
+    }
+
+    let exhaustive = std::env::var("PARETO_EXHAUSTIVE_RATES").is_ok_and(|v| v != "0");
+    if !exhaustive {
+        let max_delta = (0..num_rounds)
+            .map(|r| folding.at_round(r))
+            .min()
+            .unwrap_or(1);
+        let mut out: Vec<Vec<usize>> = Vec::new();
+
+        // Affine non-decreasing schedules from the starting rate. These are the
+        // old/default schedules and include the PR-style decay-by-2 line.
+        out.extend((0..=max_delta).map(|delta| {
+            (0..num_rounds)
+                .map(|round| starting + (round + 1) * delta)
+                .collect()
+        }));
+
+        // Also explicitly test high-rate inner rounds. In particular, log_inv=1
+        // is rate 1/2; these schedules are legal even when the starting codeword
+        // has lower rate (e.g. start=2 or 3), and they can trade more queries for
+        // fewer committed elements and smaller Merkle paths.
+        for inner in 1..=starting.min(3) {
+            out.push(vec![inner; num_rounds]);
+        }
+        if num_rounds >= 2 {
+            out.push((0..num_rounds).map(|round| 1 + round.min(2)).collect());
+            out.push((0..num_rounds).map(|round| 1 + 2 * round.min(2)).collect());
+        }
+
+        // Random legal inner-rate schedules. For round i, WHIR only requires
+        // next_rate <= prev_rate + folding_i (otherwise the RS domain would
+        // grow). Sampling this directly explores high-rate inner rounds such as
+        // log_inv_rate=1 even when the initial codeword starts at rate 1/4 or
+        // 1/8.
+        let rate_samples = std::env::var("PARETO_WHIR_RATE_SAMPLES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let fold_seed = (0..num_rounds).fold(0u64, |acc, r| {
+            acc.wrapping_mul(17) ^ (folding.at_round(r) as u64)
+        });
+        let mut rng = SmallRng::seed_from_u64(
+            BENCH_SEED ^ 0x5241_5445 ^ ((starting as u64) << 24) ^ fold_seed,
+        );
+        for _ in 0..rate_samples {
+            let mut prev = starting;
+            let mut sched = Vec::with_capacity(num_rounds);
+            for round in 0..num_rounds {
+                let next = rng.random_range(1..=prev + folding.at_round(round));
+                sched.push(next);
+                prev = next;
+            }
+            out.push(sched);
+        }
+
+        out.sort_unstable();
+        out.dedup();
+        return out;
+    }
+
+    fn rec(
+        out: &mut Vec<Vec<usize>>,
+        cur: &mut Vec<usize>,
+        folding: &FoldingFactor,
+        round: usize,
+        num_rounds: usize,
+        prev: usize,
+    ) {
+        if round == num_rounds {
+            out.push(cur.clone());
+            return;
+        }
+        // Full legal range for this inner inverse rate: any rate that does not
+        // require growing the RS domain after this fold.
+        for next in 1..=prev + folding.at_round(round) {
+            cur.push(next);
+            rec(out, cur, folding, round + 1, num_rounds, next);
+            cur.pop();
+        }
+    }
+    let mut out = Vec::new();
+    rec(&mut out, &mut Vec::new(), folding, 0, num_rounds, starting);
+    out
+}
+
+#[derive(Clone)]
 struct Record {
     protocol: &'static str,
     label: String,
-    /// This config's knob values: `(name, value)` pairs (WHIR: k/Δ/start; FRI: blowup/arity).
+    /// This config's knob values; currently emitted only for possible future CSV/plot labels.
+    #[allow(dead_code)]
     knobs: Vec<(&'static str, usize)>,
     /// Total committed oracle length in field elements (prover-cost proxy).
     oracle_len: f64,
@@ -542,7 +886,8 @@ fn main() {
     println!(
         "=== FRI vs WHIR Pareto frontier ===\n\
          m = {m} (2^{m} elements), width = 2^{log_width} = {} polys of 2^{},\n\
-         {SECURITY_LEVEL}-bit capacity-regime soundness, pow_bits = {POW_BITS}, Poseidon1.\n",
+         {SECURITY_LEVEL}-bit capacity-regime soundness, pow_bits = {POW_BITS}, Poseidon1.\n\
+         WHIR env: PARETO_WHIR_SAMPLES, PARETO_WHIR_FIRST_FOLDING, PARETO_WHIR_MAX_FOLDING, PARETO_WHIR_MAX_ROUNDS, PARETO_WHIR_STARTS.\n",
         1 << log_width,
         m - log_width,
     );
@@ -552,56 +897,76 @@ fn main() {
 
     let mut records: Vec<Record> = Vec::new();
 
-    // ---- WHIR sweep: folding factor k, schedule slope delta, starting rate ----
+    // ---- WHIR sweep: folding strategy, explicit inner rates, starting rate ----
     // Prover time is the min of `PROVE_REPS` runs to suppress scheduler noise.
     const PROVE_REPS: usize = 3;
-    println!("WHIR sweep (k, delta, starting): proving...");
-    for starting in [1usize, 2, 3] {
-        for k in [3usize, 4, 5] {
-            for delta in 0..=k {
-                let (challenger, val_mmcs, _) = poseidon1::build_kit();
-                let Some(built) = whir_build::<_, _, { poseidon1::DIGEST_ELEMS }>(
-                    m, log_width, k, delta, starting, val_mmcs, challenger,
-                ) else {
-                    println!("  k={k} delta={delta} starting={starting}: skipped (invalid)");
-                    continue;
-                };
+    let starts = parse_usize_list("PARETO_WHIR_STARTS", &[1, 2, 3]);
+    let whir_candidates = whir_random_candidates(m, &starts);
+    println!(
+        "WHIR randomized sweep (folding, starting, inner rates): proving {} candidates...",
+        whir_candidates.len()
+    );
+    for cand in whir_candidates {
+        let (challenger, val_mmcs, _) = poseidon1::build_kit();
+        let Some(built) = whir_build::<_, _, { poseidon1::DIGEST_ELEMS }>(
+            m,
+            log_width,
+            cand.folding_factor.clone(),
+            cand.round_log_inv_rates.clone(),
+            cand.starting,
+            val_mmcs,
+            challenger,
+        ) else {
+            println!("  {}: skipped (invalid)", cand.name);
+            continue;
+        };
 
-                let (commit, proof, c0, o0) = whir_prove_full(&built.rig);
-                let mut prove_ms = c0 + o0;
-                for _ in 1..PROVE_REPS {
-                    let (_, _, c, o) = whir_prove_full(&built.rig);
-                    prove_ms = prove_ms.min(c + o);
-                }
-                let verify_us = (0..3)
-                    .map(|_| whir_verify_full(&built.rig, &commit, &proof))
-                    .min()
-                    .unwrap();
-                let proof_bytes = postcard::to_allocvec(&proof).expect("postcard WHIR").len();
-
-                // PR default: starting=1, k=4, and the decay-by-2 schedule (delta=k-1).
-                let is_default = starting == 1 && k == 4 && delta == k - 1;
-                let q: Vec<String> = built.queries.iter().map(|q| q.to_string()).collect();
-                println!(
-                    "  k={k} delta={delta} starting={starting}: \
-                     oracle=2^{:.2} bytes={proof_bytes} prove={prove_ms}ms queries=[{}]{}",
-                    (built.oracle_len as f64).log2(),
-                    q.join(","),
-                    if is_default { "  <- PR default" } else { "" },
-                );
-
-                records.push(Record {
-                    protocol: "WHIR",
-                    label: format!("k={k} Δ={delta} s={starting}"),
-                    knobs: vec![("k", k), ("Δ", delta), ("start", starting)],
-                    oracle_len: built.oracle_len as f64,
-                    proof_bytes: proof_bytes as f64,
-                    prove_ms: prove_ms as f64,
-                    verify_us: verify_us as f64,
-                    is_default,
-                });
-            }
+        let (commit, proof, c0, o0) = whir_prove_full(&built.rig);
+        let mut prove_ms = c0 + o0;
+        for _ in 1..PROVE_REPS {
+            let (_, _, c, o) = whir_prove_full(&built.rig);
+            prove_ms = prove_ms.min(c + o);
         }
+        let verify_us = (0..3)
+            .map(|_| whir_verify_full(&built.rig, &commit, &proof))
+            .min()
+            .unwrap();
+        let proof_bytes = postcard::to_allocvec(&proof).expect("postcard WHIR").len();
+
+        let default_rates: Vec<usize> = (0..cand.round_log_inv_rates.len())
+            .map(|round| 1 + (round + 1) * 3)
+            .collect();
+        let is_default = cand.starting == 1
+            && matches!(cand.folding_factor, FoldingFactor::Constant(4))
+            && cand.round_log_inv_rates == default_rates;
+        let q: Vec<String> = built.queries.iter().map(|q| q.to_string()).collect();
+        let qw: Vec<String> = built.query_widths.iter().map(|w| w.to_string()).collect();
+        let queried_values: usize = built
+            .queries
+            .iter()
+            .zip(&built.query_widths)
+            .map(|(q, w)| q * w)
+            .sum();
+        println!(
+            "  {}: oracle=2^{:.2} bytes={proof_bytes} prove={prove_ms}ms queries=[{}] widths=[{}] qvals={}{}",
+            cand.name,
+            (built.oracle_len as f64).log2(),
+            q.join(","),
+            qw.join(","),
+            queried_values,
+            if is_default { "  <- PR default" } else { "" },
+        );
+
+        records.push(Record {
+            protocol: "WHIR",
+            label: cand.name,
+            knobs: vec![("k", cand.group), ("start", cand.starting)],
+            oracle_len: built.oracle_len as f64,
+            proof_bytes: proof_bytes as f64,
+            prove_ms: prove_ms as f64,
+            verify_us: verify_us as f64,
+            is_default,
+        });
     }
 
     // WHIR probing done; restore the default panic hook so any FRI panic surfaces.
@@ -614,7 +979,13 @@ fn main() {
             let num_queries = fri_min_queries(log_blowup, POW_BITS);
             let (challenger, val_mmcs, challenge_mmcs) = poseidon1::build_kit();
             let rig = fri_build(
-                m, log_width, log_blowup, max_log_arity, num_queries, val_mmcs, challenge_mmcs,
+                m,
+                log_width,
+                log_blowup,
+                max_log_arity,
+                num_queries,
+                val_mmcs,
+                challenge_mmcs,
                 challenger,
             );
             let (commit, proof, zeta, values, c0, o0) = fri_prove_full(&rig);
@@ -627,13 +998,39 @@ fn main() {
                 .map(|_| fri_verify_full(&rig, &commit, &proof, zeta, &values))
                 .min()
                 .unwrap();
-            let proof_bytes = postcard::to_allocvec(&proof).expect("postcard FRI").len();
+            // FRI's PCS API returns the opened values separately from the proof,
+            // whereas WHIR's `PcsProof` stores them in `evals`. Count both, so
+            // the plotted argument size is comparable across protocols.
+            let proof_bytes = postcard::to_allocvec(&(proof.clone(), values.clone()))
+                .expect("postcard FRI proof + openings")
+                .len();
             let oracle_len = fri_oracle_len(m, log_width, log_blowup, max_log_arity);
+
+            let arities: Vec<usize> = proof
+                .query_proofs
+                .first()
+                .map(|qp| {
+                    qp.commit_phase_openings
+                        .iter()
+                        .map(|step| step.log_arity as usize)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let sibling_values_per_query: usize = proof
+                .query_proofs
+                .first()
+                .map(|qp| {
+                    qp.commit_phase_openings
+                        .iter()
+                        .map(|step| step.sibling_values.len())
+                        .sum()
+                })
+                .unwrap_or(0);
 
             let is_default = log_blowup == 1 && max_log_arity == 1;
             println!(
                 "  blowup={log_blowup} arity=2^{max_log_arity} queries={num_queries}: \
-                 oracle=2^{:.2} bytes={proof_bytes} prove={prove_ms}ms{}",
+                 oracle=2^{:.2} bytes={proof_bytes} prove={prove_ms}ms arities={arities:?} sibvals/q={sibling_values_per_query}{}",
                 (oracle_len as f64).log2(),
                 if is_default { "  <- PR default" } else { "" },
             );
@@ -664,6 +1061,10 @@ fn main() {
     );
 }
 
+fn csv_escape(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 fn write_csv(records: &[Record]) {
     let mut s = String::new();
     s.push_str("protocol,label,oracle_len_elems,proof_bytes,prove_ms,verify_us,is_default\n");
@@ -671,11 +1072,16 @@ fn write_csv(records: &[Record]) {
         let _ = writeln!(
             s,
             "{},{},{:.0},{:.0},{:.0},{:.0},{}",
-            r.protocol, r.label, r.oracle_len, r.proof_bytes, r.prove_ms, r.verify_us, r.is_default,
+            csv_escape(r.protocol),
+            csv_escape(&r.label),
+            r.oracle_len,
+            r.proof_bytes,
+            r.prove_ms,
+            r.verify_us,
+            r.is_default,
         );
     }
-    std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/pareto_data.csv"), s)
-        .expect("write csv");
+    std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/pareto_data.csv"), s).expect("write csv");
 }
 
 // ---------------------------------------------------------------------------
@@ -683,16 +1089,6 @@ fn write_csv(records: &[Record]) {
 // measured prover time). Each panel draws dotted iso-knob curves, shaded by
 // value — WHIR grouped by k (blues), FRI grouped by log_blowup (reds). No deps.
 // ---------------------------------------------------------------------------
-
-/// WHIR iso-k shades, light→dark, indexed by ascending k (3, 4, 5).
-const WHIR_SHADES: [&str; 3] = ["#9ecae1", "#4292c6", "#08519c"];
-/// FRI iso-log_blowup shades, light→dark, indexed by ascending log_blowup (1..4).
-const FRI_SHADES: [&str; 4] = ["#fcbba1", "#fb6a4a", "#de2d26", "#a50f15"];
-
-/// This record's value for a named knob, if it has one.
-fn knob_value(r: &Record, knob: &str) -> Option<usize> {
-    r.knobs.iter().find(|(n, _)| *n == knob).map(|(_, v)| *v)
-}
 
 struct Axis {
     lo: f64,
@@ -841,57 +1237,55 @@ fn draw_panel(
         gy + gh / 2.0,
     );
 
-    // Iso-knob curves, shaded by value: WHIR by k (blues), FRI by log_blowup (reds).
-    for (proto, knob, prefix, shades) in [
-        ("FRI", "blowup", "log_blowup", FRI_SHADES.as_slice()),
-        ("WHIR", "k", "k", WHIR_SHADES.as_slice()),
-    ] {
-        let mut vals: Vec<usize> = records
+    // Draw all sampled points, then one Pareto frontier per protocol. This is
+    // more meaningful for randomized search than iso-knob curves: each protocol
+    // gets exactly one lower-left envelope in this panel.
+    for (proto, color) in [("FRI", "#de2d26"), ("WHIR", "#08519c")] {
+        let mut pts: Vec<(f64, f64, bool)> = records
             .iter()
             .filter(|r| r.protocol == proto)
-            .filter_map(|r| knob_value(r, knob))
+            .map(|r| (xs(r), r.proof_bytes, r.is_default))
             .collect();
-        vals.sort_unstable();
-        vals.dedup();
-        for (i, &val) in vals.iter().enumerate() {
-            let color = shades[i.min(shades.len() - 1)];
-            let mut pts: Vec<(f64, f64, bool)> = records
-                .iter()
-                .filter(|r| r.protocol == proto && knob_value(r, knob) == Some(val))
-                .map(|r| (xs(r), r.proof_bytes, r.is_default))
-                .collect();
-            pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-            // Dotted iso-knob line through this value's runs.
-            if pts.len() >= 2 {
-                let poly: String = pts
-                    .iter()
-                    .map(|p| format!("{:.1},{:.1}", px(p.0), py(p.1)))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let _ = writeln!(
-                    out,
-                    r##"<polyline points="{poly}" fill="none" stroke="{color}" stroke-width="1.6" stroke-dasharray="3,3" opacity="0.85"/>"##,
-                );
-            }
-            // Markers shaded by value; the PR default gets a dark ring.
-            for &(xv, yv, def) in &pts {
-                let (cx, cy) = (px(xv), py(yv));
-                let _ = writeln!(out, r##"<circle cx="{cx:.1}" cy="{cy:.1}" r="3.6" fill="{color}"/>"##);
-                if def {
-                    let _ = writeln!(
-                        out,
-                        r##"<circle cx="{cx:.1}" cy="{cy:.1}" r="6.5" fill="none" stroke="#222" stroke-width="1.6"/>"##,
-                    );
-                }
-            }
-            // Value label at the right end of the curve.
-            let last = pts.last().unwrap();
+        for &(xv, yv, def) in &pts {
+            let (cx, cy) = (px(xv), py(yv));
             let _ = writeln!(
                 out,
-                r##"<text x="{:.1}" y="{:.1}" font-size="9" fill="{color}">{prefix}={val}</text>"##,
-                px(last.0) + 4.0,
-                py(last.1) + 3.0,
+                r##"<circle cx="{cx:.1}" cy="{cy:.1}" r="3.2" fill="{color}" opacity="0.28"/>"##,
+            );
+            if def {
+                let _ = writeln!(
+                    out,
+                    r##"<circle cx="{cx:.1}" cy="{cy:.1}" r="6.5" fill="none" stroke="#222" stroke-width="1.6"/>"##,
+                );
+            }
+        }
+
+        let mut frontier = Vec::new();
+        let mut best_y = f64::INFINITY;
+        for &(xv, yv, def) in &pts {
+            if yv < best_y {
+                frontier.push((xv, yv, def));
+                best_y = yv;
+            }
+        }
+        if frontier.len() >= 2 {
+            let poly: String = frontier
+                .iter()
+                .map(|p| format!("{:.1},{:.1}", px(p.0), py(p.1)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(
+                out,
+                r##"<polyline points="{poly}" fill="none" stroke="{color}" stroke-width="3.0" opacity="0.95"/>"##,
+            );
+        }
+        for &(xv, yv, _) in &frontier {
+            let (cx, cy) = (px(xv), py(yv));
+            let _ = writeln!(
+                out,
+                r##"<circle cx="{cx:.1}" cy="{cy:.1}" r="4.8" fill="white" stroke="{color}" stroke-width="2.2"/>"##,
             );
         }
     }
@@ -912,39 +1306,33 @@ fn write_svg(m: usize, log_width: usize, records: &[Record]) {
     );
     let _ = writeln!(
         out,
-        r##"<text x="{:.1}" y="46" font-size="12" text-anchor="middle" fill="#666">m=2^{m}, 256 polys of 2^{}, {SECURITY_LEVEL}-bit capacity-regime, Poseidon1 — dotted iso-knob curves shaded by value · ◯ = PR default · lower-left is better</text>"##,
+        r##"<text x="{:.1}" y="46" font-size="12" text-anchor="middle" fill="#666">m=2^{m}, 256 polys of 2^{}, {SECURITY_LEVEL}-bit capacity-regime, Poseidon1 — solid lines are per-protocol Pareto frontiers · ◯ = PR default · lower-left is better</text>"##,
         w / 2.0,
         m - log_width,
     );
 
-    // Legend: shade ramps (WHIR blues by k, FRI reds by log_blowup).
-    let lx = w / 2.0 - 320.0;
-    let _ = writeln!(out, r##"<text x="{lx:.1}" y="64" font-size="13">WHIR — k:</text>"##);
-    for (i, c) in WHIR_SHADES.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            r##"<rect x="{:.1}" y="55" width="13" height="10" fill="{c}"/>"##,
-            lx + 58.0 + i as f64 * 15.0,
-        );
-    }
+    // Legend: one frontier per protocol.
+    let lx = w / 2.0 - 170.0;
     let _ = writeln!(
         out,
-        r##"<text x="{:.1}" y="64" font-size="11" fill="#555">3→5 (light→dark)</text>"##,
-        lx + 58.0 + WHIR_SHADES.len() as f64 * 15.0 + 6.0,
+        r##"<line x1="{lx:.1}" y1="60" x2="{:.1}" y2="60" stroke="#08519c" stroke-width="3"/>"##,
+        lx + 34.0
     );
-    let rx = w / 2.0 + 70.0;
-    let _ = writeln!(out, r##"<text x="{rx:.1}" y="64" font-size="13">FRI — log_blowup:</text>"##);
-    for (i, c) in FRI_SHADES.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            r##"<rect x="{:.1}" y="55" width="13" height="10" fill="{c}"/>"##,
-            rx + 116.0 + i as f64 * 15.0,
-        );
-    }
     let _ = writeln!(
         out,
-        r##"<text x="{:.1}" y="64" font-size="11" fill="#555">1→4 (light→dark)</text>"##,
-        rx + 116.0 + FRI_SHADES.len() as f64 * 15.0 + 6.0,
+        r##"<text x="{:.1}" y="64" font-size="13" fill="#333">WHIR frontier</text>"##,
+        lx + 42.0
+    );
+    let rx = w / 2.0 + 40.0;
+    let _ = writeln!(
+        out,
+        r##"<line x1="{rx:.1}" y1="60" x2="{:.1}" y2="60" stroke="#de2d26" stroke-width="3"/>"##,
+        rx + 34.0
+    );
+    let _ = writeln!(
+        out,
+        r##"<text x="{:.1}" y="64" font-size="13" fill="#333">FRI frontier</text>"##,
+        rx + 42.0
     );
 
     let panel_w = w / 2.0;
